@@ -1,41 +1,41 @@
 """
-앱 리뷰 분석 에이전트 (2단계) — 지침 버전만 바꿔 끼우며 실행·검증·기록
+앱 리뷰 분석 에이전트 — 지침 버전만 바꿔 끼우며 실행·검증·기록
 
 구조
   [1단계 분류 에이전트]  리뷰 전체를 읽고, 앱 자체에 대한 리뷰인지 O/X로 판단
       도구: get_reviews, save_judgments, finish_filter
       → 모든 리뷰를 판단하지 않고 끝내려 하면 반려
-  [2단계 분석 에이전트]    1단계에서 O로 걸러진 리뷰만 받아 분석하고 보고서 제출
-      도구: get_reviews(걸러진 리뷰만 보임), submit_report
+  [2단계 분석 에이전트]  1단계에서 O로 분류된 리뷰만 받아 분석하고 보고서 제출
+      도구: get_reviews(분류된 리뷰만 보임), submit_report
       → 제출하면 하네스가 자동 검증, 기준 미달이면 이유와 함께 반려 → 고쳐서 재제출
   지침 파일은 '무엇을 어떻게 할지'만 담고, 도구 사용법과 검증은 이 코드(하네스)가 제공합니다.
 
 지침 폴더 구조 (버전마다 폴더 하나)
-  prompts/v1/analyze.txt                    ← 거르기 없이 바로 분석 (filter.txt 없음)
-  prompts/v2/filter.txt + analyze.txt       ← 거르기 단계 추가
-  prompts/v3/filter.txt + analyze.txt + harness.json  ← 분석 지침 구조화 + 구조화 제출·검증 켜기
-  prompts/v5/ … harness.json에 "render_issues": true  ← 개선안 부분은 검증된 데이터로 코드가 직접 작성
-  수정본은 새 폴더로: prompts/v2-1/, prompts/v2-2/ … (이전 버전이 그대로 남음)
+  prompts/v1/analyze.txt                               ← 분류 없이 바로 분석
+  prompts/v2/filter.txt + analyze.txt                  ← 분류 단계 추가
+  prompts/v3/filter.txt + analyze.txt + harness.json   ← 분류 기준 강화, 분석 지침 구조화, 자동 검증
+  prompts/v4/filter.txt + analyze.txt + harness.json   ← 카테고리 구조, 개선안은 검증된 데이터로 작성
+  harness.json: {"structured": true} 자동 검증 / {"render_issues": true} 개선안 부분을 검증된 데이터로 작성
 
 설치
   pip install anthropic google-play-scraper pandas openpyxl
   API 키 (PowerShell):  $env:ANTHROPIC_API_KEY="키값"
          (Mac/Linux):   export ANTHROPIC_API_KEY="키값"
-  (OpenAI 키를 쓰려면 pip install openai 후 OPENAI_API_KEY 설정)
 
 1) 리뷰 수집 (최신 100개, 한 번만)
-  python run_prompt.py collect "배달의민족"
-  python run_prompt.py collect "https://play.google.com/store/apps/details?id=..."
+  python run_prompt.py collect "앱 이름 또는 플레이스토어 링크"
   → 이미 reviews.xlsx가 있으면 멈춤. 새로 받으려면 뒤에 --force
 
 2) 에이전트 실행
   python run_prompt.py v1
   python run_prompt.py v2
-  python run_prompt.py v3 --filter-from v2-2   ← 거르기는 v2-2 결과를 재사용하고 분석만 실행
+  python run_prompt.py v3
+  python run_prompt.py v4 --filter-from v3   ← 분류는 v3 결과를 재사용하고 분석만 실행
 
-3) 거르기 일관성 비교 (같은 지침을 두 번 돌린 뒤 판단이 갈린 리뷰 확인)
-  python run_prompt.py diff v2_run1 v2
+3) 분류 일관성 비교 (같은 지침을 두 번 돌린 뒤 판단이 갈린 리뷰 확인)
+  python run_prompt.py diff <결과폴더1> <결과폴더2>
 """
+import copy
 import json
 import os
 import re
@@ -47,13 +47,11 @@ import pandas as pd
 
 # ───────── 설정 ─────────
 REVIEW_FILE = "reviews.xlsx"
-PROVIDER = "auto"                    # "auto" | "anthropic" | "openai"  (auto: 설정된 API 키로 판단)
-ANTHROPIC_MODEL = "claude-sonnet-5-5"
-OPENAI_MODEL = "gpt-5.5"
+MODEL = "claude-sonnet-5-5"
 MAX_TOKENS = 16000
 TEMPERATURE = 0                      # 버전 간 비교를 위해 결과 흔들림 최소화 (지원하는 모델에서만 적용)
 MAX_TURNS = 30                       # 단계별로 에이전트가 응답할 수 있는 최대 횟수
-MAX_SUBMITS = 3                      # 검증 반려 후 재제출 허용 횟수
+MAX_SUBMITS = 3                      # 최대 제출 횟수 (반려는 최대 2번, 3번째 제출은 남은 문제를 기록하고 받음)
 REVIEW_COUNT = 100                   # 수집할 최신 리뷰 개수
 MIN_LENGTH = 10                      # 이보다 짧은 리뷰("굿", "별로" 등)는 제외
 # ────────────────────────
@@ -64,7 +62,7 @@ OUT_DIR = BASE / "outputs"
 LEVELS = {"하": 0, "중": 1, "상": 2}
 
 FILTER_SYSTEM = """\
-당신은 앱 리뷰를 거르는 에이전트입니다. 아래 도구를 사용해 작업하세요.
+당신은 앱 리뷰를 분류하는 에이전트입니다. 아래 도구를 사용해 작업하세요.
 - get_reviews: 리뷰를 읽습니다. 한 번에 최대 50개씩 읽을 수 있으니 전체 리뷰를 모두 읽으세요.
 - save_judgments: 리뷰별 판단(O/X)과 이유를 저장합니다. 여러 번 나눠 저장해도 됩니다.
 - finish_filter: 모든 리뷰의 판단을 저장했으면 호출해 작업을 마칩니다. 빠진 리뷰가 있으면 반려됩니다.
@@ -123,7 +121,7 @@ FILTER_TOOLS = [
     },
     {
         "name": "finish_filter",
-        "description": "모든 리뷰의 판단을 저장했으면 호출해 거르기 작업을 마칩니다.",
+        "description": "모든 리뷰의 판단을 저장했으면 호출해 분류 작업을 마칩니다.",
         "input_schema": {"type": "object", "properties": {}},
     },
 ]
@@ -168,7 +166,6 @@ SUBMIT_STRUCTURED = {
 }
 
 
-import copy
 SUBMIT_RENDER = copy.deepcopy(SUBMIT_STRUCTURED)
 SUBMIT_RENDER["description"] = ("최종 분석 결과를 제출합니다. report에는 요약과 카테고리별 문제점만 쓰고, "
                                 "개선안은 issues에, 근거 리뷰가 1개뿐인 요청은 others에 담습니다. "
@@ -191,6 +188,8 @@ RENDER_EXTRA = """ report에는 요약과 카테고리별 문제점만 쓰세요
 def render_report(report, issues, others):
     """검증을 통과한 데이터로 개선안 부분을 직접 작성 → 검증한 내용이 보고서에서 빠질 수 없게 함"""
     lines = [report.rstrip(), "", "## 3. 개선안 우선순위", "",
+             "해결 난이도가 낮은 개선안부터 순위를 매겼고, 난이도가 같으면 근거 리뷰가 많은 개선안을 앞에 두었습니다. "
+             "적은 노력으로 바로 해결할 수 있는 문제부터 처리하기 위한 기준입니다.", "",
              "| 순위 | 개선안 | 카테고리 | 근거 리뷰 수 | 난이도 |", "|---|---|---|---|---|"]
     for i, it in enumerate(issues, 1):
         lines.append(f"| {i} | {it['개선안']} | {it['카테고리']} | {len(set(it['근거리뷰']))} | {it['난이도']} |")
@@ -303,7 +302,7 @@ class FilterStage:
             if missing and self.finish_tries < MAX_SUBMITS:
                 return f"반려: 판단하지 않은 리뷰가 {len(missing)}개 있습니다. 번호: {missing[:30]}"
             self.done = True
-            return "거르기 완료." + (f" (미판단 {len(missing)}개는 제외 처리)" if missing else "")
+            return "분류 완료." + (f" (미판단 {len(missing)}개는 제외 처리)" if missing else "")
         return f"알 수 없는 도구: {name}"
 
     def summarize(self, name, args, out):
@@ -357,7 +356,7 @@ class AnalyzeStage:
                 problems.append("report에 개선안 섹션을 쓰지 마세요. 개선안은 issues로만 제출하면 자동으로 붙습니다.")
             cats = {str(it.get("카테고리", "")).strip() for it in issues}
             if not 3 <= len(cats) <= 7:
-                problems.append(f"개선안의 카테고리가 {len(cats)}개입니다. 비슷한 문제를 묶어 5~7개 카테고리 안에서 다루세요.")
+                problems.append(f"개선안의 카테고리가 {len(cats)}개입니다. 비슷한 문제를 묶어 7개 이하의 카테고리로 다루세요.")
         keys = [(LEVELS.get(it.get("난이도"), 9), -len(set(it.get("근거리뷰") or []))) for it in issues]
         if keys != sorted(keys):
             problems.append("우선순위 정렬이 맞지 않습니다. 난이도가 낮은 순, 같으면 근거 리뷰가 많은 순이어야 합니다.")
@@ -397,25 +396,16 @@ class AnalyzeStage:
 
 
 # ───────── 에이전트 루프 ─────────
-def pick_provider():
-    if PROVIDER != "auto":
-        return PROVIDER
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        return "anthropic"
-    if os.environ.get("OPENAI_API_KEY"):
-        return "openai"
-    print("API 키가 없습니다. ANTHROPIC_API_KEY(또는 OPENAI_API_KEY)를 설정하세요.")
-    sys.exit(1)
+def check_api_key():
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        print("API 키가 없습니다. ANTHROPIC_API_KEY를 설정하세요.")
+        sys.exit(1)
 
 
-def run_stage(label, system, tools, stage, trace, client=None, provider="anthropic"):
+def run_stage(label, system, tools, stage, trace, client=None):
     trace.append(f"\n## {label}\n")
     print(f"\n[{label}]")
-    nudge = "작업을 마쳤다면 지정된 도구를 호출해 끝내세요."
-    if provider == "openai":
-        _loop_openai(client, system, tools, stage, trace, nudge)
-    else:
-        _loop_anthropic(client, system, tools, stage, trace, nudge)
+    _loop(client, system, tools, stage, trace, nudge="작업을 마쳤다면 지정된 도구를 호출해 끝내세요.")
 
 
 def _record(stage, trace, turn, calls):
@@ -428,21 +418,21 @@ def _record(stage, trace, turn, calls):
     return results
 
 
-def _loop_anthropic(client, system, tools, stage, trace, nudge):
+def _loop(client, system, tools, stage, trace, nudge):
     if client is None:
         import anthropic
         client = anthropic.Anthropic()
     messages = [{"role": "user", "content": "지침에 따라 작업을 시작하세요."}]
     use_temp = True
     for turn in range(1, MAX_TURNS + 1):
-        kwargs = dict(model=ANTHROPIC_MODEL, max_tokens=MAX_TOKENS, system=system, tools=tools, messages=messages)
+        kwargs = dict(model=MODEL, max_tokens=MAX_TOKENS, system=system, tools=tools, messages=messages)
         if use_temp:
             kwargs["temperature"] = TEMPERATURE
         try:
             with client.messages.stream(**kwargs) as stream:
                 resp = stream.get_final_message()
-        except (TypeError, Exception) as e:
-            # 최신 SDK/모델에서 temperature를 받지 않으면 빼고 다시 호출
+        except Exception as e:
+            # SDK나 모델이 temperature를 받지 않으면 빼고 다시 호출
             if use_temp and "temperature" in str(e):
                 use_temp = False
                 kwargs.pop("temperature")
@@ -466,94 +456,47 @@ def _loop_anthropic(client, system, tools, stage, trace, nudge):
             return
 
 
-def _loop_openai(client, system, tools, stage, trace, nudge):
-    if client is None:
-        from openai import OpenAI
-        client = OpenAI()
-    fns = [{"type": "function", "function": {
-        "name": t["name"], "description": t["description"], "parameters": t["input_schema"]}} for t in tools]
-    messages = [{"role": "system", "content": system},
-                {"role": "user", "content": "지침에 따라 작업을 시작하세요."}]
-    use_temp = True
-    for turn in range(1, MAX_TURNS + 1):
-        kwargs = dict(model=OPENAI_MODEL, messages=messages, tools=fns, max_completion_tokens=MAX_TOKENS)
-        if use_temp:
-            kwargs["temperature"] = TEMPERATURE
-        try:
-            resp = client.chat.completions.create(**kwargs)
-        except Exception as e:
-            if use_temp and "temperature" in str(e):
-                use_temp = False
-                kwargs.pop("temperature")
-                resp = client.chat.completions.create(**kwargs)
-            else:
-                raise
-        msg = resp.choices[0].message
-        entry = {"role": "assistant", "content": msg.content or ""}
-        if msg.tool_calls:
-            entry["tool_calls"] = [{"id": tc.id, "type": "function",
-                                    "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
-                                   for tc in msg.tool_calls]
-        messages.append(entry)
-        if msg.content and msg.content.strip():
-            trace.append(f"- **[{turn}] 에이전트**: {msg.content.strip()[:300]}")
-        if not msg.tool_calls:
-            messages.append({"role": "user", "content": nudge})
-            trace.append(f"- [{turn}] 도구 없이 응답 → 마무리 요청")
-            continue
-        calls = []
-        for tc in msg.tool_calls:
-            try:
-                args = json.loads(tc.function.arguments or "{}")
-            except json.JSONDecodeError:
-                args = {}
-            calls.append((tc.id, tc.function.name, args))
-        for cid, out in _record(stage, trace, turn, calls):
-            messages.append({"role": "tool", "tool_call_id": cid, "content": out})
-        if stage.done:
-            return
-
-
 # ───────── 실행 ─────────
 def load_judgments(version):
     path = OUT_DIR / version / "filter.xlsx"
     if not path.exists():
-        print(f"재사용할 거르기 결과가 없습니다: {path}")
+        print(f"재사용할 분류 결과가 없습니다: {path}")
         sys.exit(1)
     f = pd.read_excel(path)
     return {int(r["번호"]): {"판단": r["AI 판단"], "이유": r["AI 이유"]} for _, r in f.iterrows()
             if r["AI 판단"] in ("O", "X")}
 
 
-def run_version(version, filter_from=None, client=None, provider=None):
+def run_version(version, filter_from=None, client=None):
     vdir = PROMPT_DIR / version
     analyze_path, filter_path = vdir / "analyze.txt", vdir / "filter.txt"
     if not analyze_path.exists():
         print(f"분석 지침이 없습니다: {analyze_path}")
         sys.exit(1)
-    opts = load_harness_options(vdir)     # 설정 오류는 거르기 전에 미리 확인
-    provider = provider or pick_provider()
+    opts = load_harness_options(vdir)     # 설정 오류는 분류 전에 미리 확인
+    if client is None:
+        check_api_key()
     df = pd.read_excel(BASE / REVIEW_FILE)
     out = OUT_DIR / version
     out.mkdir(parents=True, exist_ok=True)
-    trace = [f"# {version} 에이전트 작업 기록", f"- 모델: {OPENAI_MODEL if provider == 'openai' else ANTHROPIC_MODEL}",
+    trace = [f"# {version} 에이전트 작업 기록", f"- 모델: {MODEL}",
              f"- 실행: {datetime.now():%Y-%m-%d %H:%M}"]
     print(f"[{version}] 리뷰 {len(df)}개")
 
-    # 1단계: 거르기
+    # 1단계: 분류
     judgments = None
     if filter_from:
         judgments = load_judgments(filter_from)
-        trace.append(f"\n## 1단계 거르기\n\n- {filter_from}의 거르기 결과 재사용")
-        print(f"\n[1단계 거르기] {filter_from} 결과 재사용")
+        trace.append(f"\n## 1단계 분류\n\n- {filter_from}의 분류 결과 재사용")
+        print(f"\n[1단계 분류] {filter_from} 결과 재사용")
     elif filter_path.exists():
         fs = FilterStage(df)
-        run_stage("1단계 거르기", FILTER_SYSTEM + filter_path.read_text(encoding="utf-8").strip(),
-                  FILTER_TOOLS, fs, trace, client, provider)
+        run_stage("1단계 분류", FILTER_SYSTEM + filter_path.read_text(encoding="utf-8").strip(),
+                  FILTER_TOOLS, fs, trace, client)
         judgments = fs.judgments
     else:
-        trace.append("\n## 1단계 거르기\n\n- 없음 (모든 리뷰를 그대로 분석)")
-        print("\n[1단계 거르기] 없음 → 모든 리뷰를 분석")
+        trace.append("\n## 1단계 분류\n\n- 없음 (모든 리뷰를 그대로 분석)")
+        print("\n[1단계 분류] 없음 → 모든 리뷰를 분석")
 
     if judgments is not None:
         sheet = df[["번호", "별점", "리뷰"]].copy()
@@ -579,7 +522,7 @@ def run_version(version, filter_from=None, client=None, provider=None):
     tools = [GET_REVIEWS, submit]
     label = "2단계 분석" + (" (구조화 제출·검증 켜짐)" if opts["structured"] else "")
     run_stage(label, system + analyze_path.read_text(encoding="utf-8").strip(),
-              tools, st, trace, client, provider)
+              tools, st, trace, client)
 
     # 저장 (실행 중에 outputs 폴더가 지워졌어도 다시 만들어 결과를 잃지 않게 함)
     final = st.final or {"report": "(제출 없음: 최대 턴 수 초과)", "issues": [], "unresolved": []}
@@ -597,7 +540,7 @@ def run_version(version, filter_from=None, client=None, provider=None):
     log = OUT_DIR / "run_log.csv"
     pd.DataFrame([{
         "버전": version, "실행시각": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "거르기": f"재사용({filter_from})" if filter_from else ("실행" if judgments is not None else "없음"),
+        "분류": f"재사용({filter_from})" if filter_from else ("실행" if judgments is not None else "없음"),
         "분석대상": len(kept), "무관제외": len(df) - len(kept),
         "제출횟수": st.submits, "반려횟수": rejected, "개선안수": len(final["issues"]),
         "미해결문제": len(final["unresolved"]) if st.final else "미제출",
@@ -611,7 +554,7 @@ def run_version(version, filter_from=None, client=None, provider=None):
 
 
 def diff_filters(a, b):
-    """두 실행의 거르기 결과를 비교해 판단이 갈린 리뷰를 보여줌 (기준이 애매한 리뷰 찾기)"""
+    """두 실행의 분류 결과를 비교해 판단이 갈린 리뷰를 보여줌 (기준이 애매한 리뷰 찾기)"""
     fa, fb = [pd.read_excel(OUT_DIR / v / "filter.xlsx") for v in (a, b)]
     m = fa[["번호", "별점", "리뷰", "AI 판단", "AI 이유"]].merge(
         fb[["번호", "AI 판단", "AI 이유"]], on="번호", suffixes=(f"_{a}", f"_{b}"))
@@ -638,7 +581,7 @@ def main():
         sys.exit(1)
     if sys.argv[1] == "diff":
         if len(sys.argv) < 4:
-            print("사용법: python run_prompt.py diff <결과폴더1> <결과폴더2>   예) diff v2_run1 v2")
+            print("사용법: python run_prompt.py diff <결과폴더1> <결과폴더2>   예) diff v3 v4")
             sys.exit(1)
         diff_filters(sys.argv[2], sys.argv[3])
         return
